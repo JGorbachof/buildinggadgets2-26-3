@@ -1,0 +1,333 @@
+package com.direwolf20.buildinggadgets2.common.worlddata;
+
+import com.direwolf20.buildinggadgets2.BuildingGadgets2;
+import com.direwolf20.buildinggadgets2.util.VecHelpers;
+import com.direwolf20.buildinggadgets2.util.datatypes.StatePos;
+import com.direwolf20.buildinggadgets2.util.datatypes.TagPos;
+import com.google.common.collect.BiMap;
+import com.google.common.collect.HashBiMap;
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.UUIDUtil;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.saveddata.SavedData;
+import net.minecraft.world.level.saveddata.SavedDataType;
+import net.minecraft.world.phys.AABB;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.UUID;
+
+public class BG2Data extends SavedData {
+    private static final String NAME = "buildinggadgets2";
+    // Bound the packed int buffer to 64 MiB; this does not raise gadget limits.
+    static final int MAX_PACKED_CELLS = 16_777_216;
+
+    private static final Codec<StatePos> STATEPOS_CODEC = CompoundTag.CODEC.xmap(StatePos::new, StatePos::getTag);
+    private static final Codec<TagPos> TAGPOS_CODEC = CompoundTag.CODEC.xmap(TagPos::new, TagPos::getTag);
+
+    private static final Codec<ArrayList<StatePos>> FLAT_STATEPOS_LIST_CODEC =
+            STATEPOS_CODEC.listOf().xmap(ArrayList::new, l -> l);
+
+    private static final Codec<ArrayList<StatePos>> PACKED_STATEPOS_LIST_CODEC =
+            CompoundTag.CODEC.xmap(BG2Data::statePosListFromNBTMapArray, BG2Data::statePosListToNBTMapArray);
+
+    private static final Codec<ArrayList<TagPos>> TAGPOS_LIST_CODEC =
+            TAGPOS_CODEC.listOf().xmap(ArrayList::new, l -> l);
+
+    private static final Codec<HashMap<UUID, ArrayList<StatePos>>> UNDO_MAP_CODEC =
+            Codec.unboundedMap(UUIDUtil.STRING_CODEC, FLAT_STATEPOS_LIST_CODEC)
+                    .xmap(HashMap::new, m -> m);
+
+    private static final Codec<HashMap<UUID, ArrayList<StatePos>>> COPY_MAP_CODEC =
+            Codec.unboundedMap(UUIDUtil.STRING_CODEC, PACKED_STATEPOS_LIST_CODEC)
+                    .xmap(HashMap::new, m -> m);
+
+    private static final Codec<HashMap<UUID, ArrayList<TagPos>>> TE_MAP_CODEC =
+            Codec.unboundedMap(UUIDUtil.STRING_CODEC, TAGPOS_LIST_CODEC)
+                    .xmap(HashMap::new, m -> m);
+
+    private static final Codec<BiMap<UUID, String>> REDPRINT_MAP_CODEC =
+            Codec.unboundedMap(UUIDUtil.STRING_CODEC, Codec.STRING)
+                    .xmap(m -> {
+                        BiMap<UUID, String> bi = HashBiMap.create();
+                        bi.putAll(m);
+                        return bi;
+                    }, bi -> bi);
+
+    public static final Codec<BG2Data> CODEC = RecordCodecBuilder.create(i -> i.group(
+            UNDO_MAP_CODEC.optionalFieldOf("undolist", new HashMap<>()).forGetter(d -> d.undoList),
+            COPY_MAP_CODEC.optionalFieldOf("copypaste", new HashMap<>()).forGetter(d -> d.copyPasteLookup),
+            TE_MAP_CODEC.optionalFieldOf("temaptag", new HashMap<>()).forGetter(d -> d.teMap),
+            REDPRINT_MAP_CODEC.optionalFieldOf("redprinttag", HashBiMap.create()).forGetter(d -> d.redprintLookup)
+    ).apply(i, BG2Data::new));
+
+    public static final SavedDataType<BG2Data> TYPE = new SavedDataType<>(
+            Identifier.fromNamespaceAndPath(BuildingGadgets2.MODID, NAME),
+            () -> new BG2Data(new HashMap<>(), new HashMap<>(), new HashMap<>(), HashBiMap.create()),
+            CODEC
+    );
+
+    private final HashMap<UUID, ArrayList<StatePos>> undoList; //GadgetUUID -> UndoList StatePosData
+    private final HashMap<UUID, ArrayList<StatePos>> copyPasteLookup; //GadgetUUID -> StatePosData
+    private final HashMap<UUID, ArrayList<TagPos>> teMap; //GadgetUUID -> Tile Entity Data
+    private final BiMap<UUID, String> redprintLookup; //A list of RedPrint names to UUIDs
+
+    public BG2Data(HashMap<UUID, ArrayList<StatePos>> undoList, HashMap<UUID, ArrayList<StatePos>> copyPasteLookup, HashMap<UUID, ArrayList<TagPos>> teMap, BiMap<UUID, String> redprintLookup) {
+        // Defensive copies — the Codec optionalFieldOf defaults are shared across decode calls,
+        // and this SavedData mutates these fields in place throughout its lifetime.
+        this.undoList = new HashMap<>(undoList);
+        this.copyPasteLookup = new HashMap<>(copyPasteLookup);
+        this.teMap = new HashMap<>(teMap);
+        this.redprintLookup = HashBiMap.create(redprintLookup);
+    }
+
+    public boolean addToRedprints(UUID uuid, String name) {
+        if (redprintLookup.containsKey(uuid)) return false;
+        if (redprintLookup.containsValue(name)) return false;
+        redprintLookup.put(uuid, name);
+        return true;
+    }
+
+    public boolean removeFromRedprints(String name) {
+        if (redprintLookup.containsValue(name)) {
+            UUID uuid = redprintLookup.inverse().get(name);
+            redprintLookup.remove(uuid);
+            copyPasteLookup.remove(uuid);
+            teMap.remove(uuid);
+            return true;
+        }
+        return false;
+    }
+
+    public UUID getRedprintUUIDfromName(String name) {
+        if (redprintLookup.containsValue(name))
+            return redprintLookup.inverse().get(name);
+        return null;
+    }
+
+    public BiMap<UUID, String> getRedprintLookup() {
+        return redprintLookup;
+    }
+
+    public boolean containsUndoList(UUID uuid) {
+        return undoList.containsKey(uuid);
+    }
+
+    public void addToUndoList(UUID uuid, ArrayList<StatePos> list, Level level) {
+        undoList.put(uuid, list);
+        this.setDirty();
+    }
+
+    public void removeFromUndoList(UUID uuid) {
+        undoList.remove(uuid);
+        this.setDirty();
+    }
+
+    public void addToCopyPaste(UUID uuid, ArrayList<StatePos> list) {
+        copyPasteLookup.put(uuid, list);
+        this.setDirty();
+    }
+
+    public void addToTEMap(UUID uuid, ArrayList<TagPos> list) {
+        teMap.put(uuid, list);
+        this.setDirty();
+    }
+
+    public boolean moveCutData(UUID source,UUID target) {
+        if (source.equals(target)) return false;
+        var cells = copyPasteLookup.get(source);
+        var tiles = teMap.get(source);
+        if (cells == null || cells.stream().noneMatch(cell -> !cell.state.isAir()) || tiles == null) return false;
+        var targetCells = copyPasteLookup.get(target);
+        if (targetCells != null && targetCells.stream().anyMatch(cell -> !cell.state.isAir())) return false;
+        copyPasteLookup.put(target,new ArrayList<>(cells));
+        teMap.put(target,new ArrayList<>(tiles));
+        copyPasteLookup.remove(source);
+        teMap.remove(source);
+        undoList.remove(source);
+        // Named redprints remain available for the explicit admin-only recovery command.
+        // Archive under a different UUID so a stale player item cannot load the cargo twice.
+        String archiveName = redprintLookup.remove(source);
+        if (archiveName != null) {
+            UUID archive = UUID.randomUUID();
+            copyPasteLookup.put(archive,new ArrayList<>(cells));
+            teMap.put(archive,new ArrayList<>(tiles));
+            redprintLookup.put(archive,archiveName);
+        }
+        setDirty();
+        return true;
+    }
+
+    public ArrayList<StatePos> getCopyPasteList(UUID uuid, boolean remove) {
+        ArrayList<StatePos> returnList = copyPasteLookup.get(uuid);
+        if (remove) {
+            returnList = copyPasteLookup.remove(uuid);
+            this.setDirty();
+        }
+        return returnList;
+    }
+
+    public CompoundTag getCopyPasteListAsNBTMap(UUID uuid, boolean remove) {
+        return statePosListToNBTMapArray(getCopyPasteList(uuid, remove));
+    }
+
+    public ArrayList<StatePos> peekUndoList(UUID uuid) {
+        ArrayList<StatePos> posList = undoList.get(uuid);
+        this.setDirty();
+        return posList;
+    }
+
+    public ArrayList<StatePos> popUndoList(UUID uuid) {
+        ArrayList<StatePos> posList = undoList.remove(uuid);
+        this.setDirty();
+        return posList;
+    }
+
+    public ArrayList<TagPos> peekTEMap(UUID uuid) {
+        ArrayList<TagPos> tagList = teMap.get(uuid);
+        return tagList;
+    }
+
+    public ArrayList<TagPos> getTEMap(UUID uuid) {
+        ArrayList<TagPos> tagList = teMap.remove(uuid);
+        this.setDirty();
+        return tagList;
+    }
+
+    public static CompoundTag statePosListToNBTMapArray(ArrayList<StatePos> list) {
+        CompoundTag tag = new CompoundTag();
+        if (list == null || list.isEmpty()) return tag;
+        ArrayList<StatePos> snapshot = new ArrayList<>(list);
+        BlockPos start = Objects.requireNonNull(snapshot.getFirst().pos).immutable();
+        BlockPos end = Objects.requireNonNull(snapshot.getLast().pos).immutable();
+        BlockPos min = new BlockPos(Math.min(start.getX(), end.getX()), Math.min(start.getY(), end.getY()), Math.min(start.getZ(), end.getZ()));
+        BlockPos max = new BlockPos(Math.max(start.getX(), end.getX()), Math.max(start.getY(), end.getY()), Math.max(start.getZ(), end.getZ()));
+        for (StatePos entry : snapshot) {
+            Objects.requireNonNull(entry);
+            Objects.requireNonNull(entry.state);
+            Objects.requireNonNull(entry.pos);
+            min = new BlockPos(Math.min(min.getX(), entry.pos.getX()), Math.min(min.getY(), entry.pos.getY()), Math.min(min.getZ(), entry.pos.getZ()));
+            max = new BlockPos(Math.max(max.getX(), entry.pos.getX()), Math.max(max.getY(), entry.pos.getY()), Math.max(max.getZ(), entry.pos.getZ()));
+        }
+        int volume = checkedPackedVolume(min, max);
+        AABB originalBounds = VecHelpers.aabbFromBlockPos(start, end);
+        // Preserve normal endpoint orientation, but never silently drop outliers.
+        if (min.getX() < originalBounds.minX || min.getY() < originalBounds.minY || min.getZ() < originalBounds.minZ
+                || max.getX() > originalBounds.maxX || max.getY() > originalBounds.maxY || max.getZ() > originalBounds.maxZ) {
+            start = min;
+            end = max;
+        }
+        Map<BlockPos, BlockState> blockStateByPos = new HashMap<>();
+        LinkedHashMap<BlockState, Integer> paletteIndices = new LinkedHashMap<>();
+        for (StatePos entry : snapshot) {
+            // A coordinate represents one cell; the newest duplicate record wins.
+            blockStateByPos.put(entry.pos.immutable(), entry.state);
+            paletteIndices.computeIfAbsent(entry.state, ignored -> paletteIndices.size());
+        }
+        BlockState air = Blocks.VOID_AIR.defaultBlockState();
+        // Resizing alone is insufficient: indexOf(null) would encode -1 for gaps.
+        if (blockStateByPos.size() < volume) {
+            paletteIndices.computeIfAbsent(air, ignored -> paletteIndices.size());
+        }
+        int[] blocklist = new int[volume];
+        int cursor = 0;
+        for (int i = 0; i < volume; i++) {
+            BlockPos pos = packedPosition(min,max,i);
+            blocklist[cursor++] = paletteIndices.get(blockStateByPos.getOrDefault(pos, air));
+        }
+        tag.put("startpos", writeBlockPos(start));
+        tag.put("endpos", writeBlockPos(end));
+        tag.put("blockstatemap", StatePos.getBlockStateNBT(new ArrayList<>(paletteIndices.keySet())));
+        tag.putIntArray("statelist", blocklist); //Todo - Short Array?
+        return tag;
+    }
+
+    private static BlockPos packedPosition(BlockPos min, BlockPos max, int index) {
+        long width = (long) max.getX() - min.getX() + 1;
+        long height = (long) max.getY() - min.getY() + 1;
+        return new BlockPos((int)(min.getX() + index % width),
+                (int)(min.getY() + index / width % height),
+                (int)(min.getZ() + index / (width * height)));
+    }
+
+    static int checkedPackedVolume(BlockPos min, BlockPos max) {
+        try {
+            long x = (long) max.getX() - min.getX() + 1;
+            long y = (long) max.getY() - min.getY() + 1;
+            long z = (long) max.getZ() - min.getZ() + 1;
+            long volume = Math.multiplyExact(Math.multiplyExact(x, y), z);
+            if (x <= 0 || y <= 0 || z <= 0 || volume > MAX_PACKED_CELLS) {
+                throw new IllegalArgumentException("Copy bounds exceed safe packed volume");
+            }
+            return Math.toIntExact(volume);
+        } catch (ArithmeticException e) {
+            throw new IllegalArgumentException("Copy bounds overflow packed volume", e);
+        }
+    }
+
+    /**
+     * Something Changed in NBTUtils.ReadBlockPos that broke templates, so i made the below as a workaround
+     */
+    public static BlockPos readBlockPos(CompoundTag compoundTag, String pKey) {
+        if (!compoundTag.contains(pKey)) return BlockPos.ZERO;
+        CompoundTag tag = compoundTag.getCompoundOrEmpty(pKey);
+        return new BlockPos(tag.getIntOr("X", 0), tag.getIntOr("Y", 0), tag.getIntOr("Z", 0));
+    }
+
+    public static CompoundTag writeBlockPos(BlockPos pPos) {
+        CompoundTag compoundtag = new CompoundTag();
+        compoundtag.putInt("X", pPos.getX());
+        compoundtag.putInt("Y", pPos.getY());
+        compoundtag.putInt("Z", pPos.getZ());
+        return compoundtag;
+    }
+
+    public static ArrayList<StatePos> statePosListFromNBTMapArray(CompoundTag tag) {
+        return decodeCopyData(tag,MAX_PACKED_CELLS);
+    }
+
+    public static ArrayList<StatePos> decodeCopyData(CompoundTag tag,int maxCells) {
+        ArrayList<StatePos> statePosList = new ArrayList<>();
+        if (tag.isEmpty()) return statePosList;
+        if (!tag.contains("blockstatemap") || !tag.contains("statelist"))
+            throw new IllegalArgumentException("Missing copy palette or cells");
+        ArrayList<BlockState> blockStateMap = StatePos.getBlockStateMapFromNBT(tag.getListOrEmpty("blockstatemap"));
+        for (String bound : new String[]{"startpos","endpos"}) {
+            var value = tag.getCompoundOrEmpty(bound);
+            if (value.getInt("X").isEmpty() || value.getInt("Y").isEmpty() || value.getInt("Z").isEmpty())
+                throw new IllegalArgumentException("Invalid copy bounds");
+        }
+        BlockPos start = readBlockPos(tag, "startpos");
+        BlockPos end = readBlockPos(tag, "endpos");
+        BlockPos min = new BlockPos(Math.min(start.getX(),end.getX()),Math.min(start.getY(),end.getY()),Math.min(start.getZ(),end.getZ()));
+        BlockPos max = new BlockPos(Math.max(start.getX(),end.getX()),Math.max(start.getY(),end.getY()),Math.max(start.getZ(),end.getZ()));
+        int volume = checkedPackedVolume(min,max);
+        if (volume > maxCells) throw new IllegalArgumentException("Copy exceeds cell limit");
+        int[] blocklist = tag.getIntArray("statelist").orElseThrow(() -> new IllegalArgumentException("Missing copy cells"));
+        if (blocklist.length != volume || blockStateMap.isEmpty())
+            throw new IllegalArgumentException("Invalid copy volume or palette");
+        for (int index : blocklist)
+            if (index < 0 || index >= blockStateMap.size())
+                throw new IllegalArgumentException("Invalid copy palette index");
+        int cursor = 0;
+        for (int i = 0; i < volume; i++)
+            statePosList.add(new StatePos(blockStateMap.get(blocklist[cursor++]),packedPosition(min,max,i)));
+        return statePosList;
+    }
+
+    public static BG2Data get(ServerLevel world) {
+        BG2Data bg2Data = world.getDataStorage().computeIfAbsent(TYPE);
+        bg2Data.setDirty();
+        return bg2Data;
+    }
+}

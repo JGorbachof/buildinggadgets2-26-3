@@ -1,0 +1,54 @@
+package com.direwolf20.buildinggadgets2.client.events;
+
+import com.direwolf20.buildinggadgets2.BuildingGadgets2;
+import com.direwolf20.buildinggadgets2.client.KeyBindings;
+import com.direwolf20.buildinggadgets2.client.screen.DestructionGUI;
+import com.direwolf20.buildinggadgets2.client.screen.ModeRadialMenu;
+import com.direwolf20.buildinggadgets2.common.items.BaseGadget;
+import com.direwolf20.buildinggadgets2.common.items.GadgetDestruction;
+import com.direwolf20.buildinggadgets2.common.network.data.AnchorPayload;
+import com.direwolf20.buildinggadgets2.common.network.data.RangeChangePayload;
+import com.direwolf20.buildinggadgets2.common.network.data.UndoPayload;
+import com.direwolf20.buildinggadgets2.util.GadgetNBT;
+import net.minecraft.client.KeyMapping;
+import net.minecraft.client.Minecraft;
+import net.minecraft.world.item.ItemStack;
+import net.neoforged.api.distmarker.Dist;
+import net.neoforged.bus.api.SubscribeEvent;
+import net.neoforged.fml.common.EventBusSubscriber;
+import net.neoforged.neoforge.client.event.ClientTickEvent;
+import net.neoforged.neoforge.client.network.ClientPacketDistributor;
+import net.neoforged.neoforge.client.settings.KeyModifier;
+
+@EventBusSubscriber(modid = BuildingGadgets2.MODID, value = Dist.CLIENT)
+public class EventKeyInput {
+
+    @SubscribeEvent
+    public static void handleEventInput(ClientTickEvent.Post event) {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null)
+            return;
+
+        ItemStack tool = BaseGadget.getGadget(mc.player);
+        if (tool.isEmpty())
+            return;
+
+        KeyMapping mode = KeyBindings.menuSettings;
+        // TODO(port): 26.1 replaced KeyModifier.getActiveModifier() with getActiveModifiers() returning a List. Mapping "no active modifier" → "active modifiers list is empty".
+        if (!(mc.gui.screen() instanceof ModeRadialMenu) && mode.consumeClick() && ((mode.getKeyModifier() == KeyModifier.NONE
+                && KeyModifier.getActiveModifiers().isEmpty()) || mode.getKeyModifier() != KeyModifier.NONE)) {
+            if (tool.getItem() instanceof GadgetDestruction)
+                mc.gui.setScreen(new DestructionGUI(tool, true));
+            else
+                mc.gui.setScreen(new ModeRadialMenu(tool));
+        } else if (KeyBindings.undo.consumeClick()) {
+            ClientPacketDistributor.sendToServer(new UndoPayload());
+        } else if (KeyBindings.anchor.consumeClick()) {
+            ClientPacketDistributor.sendToServer(new AnchorPayload());
+        } else if (KeyBindings.range.consumeClick()) {
+            int oldRange = GadgetNBT.getToolRange(tool);
+            int newRange = oldRange + 1 > 15 ? 1 : oldRange + 1;
+            ClientPacketDistributor.sendToServer(new RangeChangePayload(newRange));
+        }
+    }
+}

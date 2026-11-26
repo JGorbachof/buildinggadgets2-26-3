@@ -1,0 +1,254 @@
+package com.direwolf20.buildinggadgets2.common.items;
+
+import com.direwolf20.buildinggadgets2.api.gadgets.GadgetModes;
+import com.direwolf20.buildinggadgets2.api.gadgets.GadgetTarget;
+import com.direwolf20.buildinggadgets2.common.events.ServerTickHandler;
+import com.direwolf20.buildinggadgets2.common.worlddata.BG2Data;
+import com.direwolf20.buildinggadgets2.util.*;
+import com.direwolf20.buildinggadgets2.util.context.ItemActionContext;
+import com.direwolf20.buildinggadgets2.util.datatypes.StatePos;
+import com.direwolf20.buildinggadgets2.util.modes.BaseMode;
+import com.google.common.collect.ImmutableSortedSet;
+import net.minecraft.ChatFormatting;
+import net.minecraft.client.Minecraft;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.GlobalPos;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.MutableComponent;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.InteractionResult;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.TooltipFlag;
+import net.minecraft.world.item.component.TooltipDisplay;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.entity.BlockEntity;
+import net.minecraft.world.phys.BlockHitResult;
+
+import net.neoforged.neoforge.capabilities.Capabilities;
+
+import java.util.*;
+import java.util.function.Consumer;
+
+public abstract class BaseGadget extends Item {
+
+    public BaseGadget(Properties properties) {
+        super(properties);
+    }
+
+    /**
+     * Forge Energy Storage methods
+     */
+
+    public abstract int getEnergyMax();
+
+    public abstract int getEnergyCost();
+
+    @Override
+    public int getMaxDamage(ItemStack stack) {
+        return getEnergyMax();
+    }
+
+    @Override
+    public boolean isBarVisible(ItemStack stack) {
+        var energy = stack.getCapability(Capabilities.Energy.ITEM, null);
+        if (energy == null) {
+            return false;
+        }
+
+        return (energy.getAmountAsInt() < energy.getCapacityAsInt());
+    }
+
+    @Override
+    public int getBarWidth(ItemStack stack) {
+        var energy = stack.getCapability(Capabilities.Energy.ITEM, null);
+        if (energy == null) {
+            return 0;
+        }
+
+        return Math.min(13 * energy.getAmountAsInt() / energy.getCapacityAsInt(), 13);
+    }
+
+    @Override
+    public int getBarColor(ItemStack stack) {
+        var energy = stack.getCapability(Capabilities.Energy.ITEM, null);
+        if (energy == null) {
+            return super.getBarColor(stack);
+        }
+
+        return Mth.hsvToRgb(Math.max(0.0F, (float) energy.getAmountAsInt() / (float) energy.getCapacityAsInt()) / 3.0F, 1.0F, 1.0F);
+    }
+
+    @Override
+    public void appendHoverText(ItemStack stack, Item.TooltipContext context, TooltipDisplay display, Consumer<Component> tooltip, TooltipFlag flagIn) {
+        super.appendHoverText(stack, context, display, tooltip, flagIn);
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.level == null || mc.player == null) {
+            return;
+        }
+
+        boolean sneakPressed = Minecraft.getInstance().hasShiftDown();
+
+        if (!sneakPressed) {
+            tooltip.accept(Component.translatable("buildinggadgets2.tooltips.holdshift",
+                            "shift")
+                    .withStyle(ChatFormatting.GRAY));
+        } else {
+            GlobalPos boundTo = GadgetNBT.getBoundPos(stack);
+            if (boundTo != null) {
+                tooltip.accept(Component.translatable("buildinggadgets2.tooltips.boundto", boundTo.dimension().identifier().getPath(), "[" + boundTo.pos().toShortString() + "]").setStyle(Styles.GOLD));
+            }
+        }
+
+        var energy = stack.getCapability(Capabilities.Energy.ITEM, null);
+        if (energy != null) {
+            MutableComponent energyText = !sneakPressed
+                    ? Component.translatable("buildinggadgets2.tooltips.energy", MagicHelpers.tidyValue(energy.getAmountAsInt()), MagicHelpers.tidyValue(energy.getCapacityAsInt()))
+                    : Component.translatable("buildinggadgets2.tooltips.energy", String.format("%,d", energy.getAmountAsInt()), String.format("%,d", energy.getCapacityAsInt()));
+
+            tooltip.accept(energyText.withStyle(ChatFormatting.GREEN));
+        }
+    }
+
+    /**
+     * Implementation level of for the onAction & onShiftAction methods below.
+     */
+    @Override
+    public InteractionResult use(Level level, Player player, InteractionHand hand) {
+        ItemStack gadget = player.getItemInHand(hand);
+
+        if (level.isClientSide()) //No client
+            return InteractionResult.SUCCESS.heldItemTransformedTo(gadget);
+
+        BlockHitResult lookingAt = VectorHelper.getLookingAt(player, gadget);
+        if (level.getBlockState(lookingAt.getBlockPos()).isAir() && GadgetNBT.getAnchorPos(gadget).equals(GadgetNBT.nullPos))
+            return InteractionResult.SUCCESS.heldItemTransformedTo(gadget);
+        ItemActionContext context = new ItemActionContext(lookingAt.getBlockPos(), lookingAt, player, level, hand, gadget);
+
+        if (player.isShiftKeyDown()) {
+            if (GadgetNBT.getSetting(gadget, GadgetNBT.ToggleableSettings.BIND.getName())) {
+                if (bindToInventory(level, player, gadget, lookingAt)) {
+                    GadgetNBT.toggleSetting(gadget, GadgetNBT.ToggleableSettings.BIND.getName()); //Turn off bind
+                    return InteractionResult.SUCCESS.heldItemTransformedTo(gadget);
+                } else {
+                    return InteractionResult.FAIL;
+                }
+            }
+            return this.onShiftAction(context);
+        }
+
+        return this.onAction(context);
+    }
+
+    InteractionResult onAction(ItemActionContext context) {
+        return InteractionResult.PASS;
+    }
+
+    InteractionResult onShiftAction(ItemActionContext context) {
+        return InteractionResult.PASS;
+    }
+
+    public boolean bindToInventory(Level level, Player player, ItemStack gadget, BlockHitResult lookingAt) {
+        BlockEntity blockEntity = level.getBlockEntity(lookingAt.getBlockPos());
+        if (blockEntity != null) {
+            var itemHandler = level.getCapability(Capabilities.Item.BLOCK, lookingAt.getBlockPos(), lookingAt.getDirection());
+            if (itemHandler != null) {
+                GadgetNBT.setBoundPos(gadget, new GlobalPos(level.dimension(), lookingAt.getBlockPos()));
+                GadgetNBT.setToolValue(gadget, lookingAt.getDirection().ordinal(), GadgetNBT.IntSettings.BIND_DIRECTION.getName());
+                player.sendOverlayMessage(Component.translatable("buildinggadgets2.messages.bindsuccess", lookingAt.getBlockPos().toShortString()));
+                return true;
+            }
+        }
+        GlobalPos existingBind = GadgetNBT.getBoundPos(gadget);
+        if (existingBind == null)
+            player.sendOverlayMessage(Component.translatable("buildinggadgets2.messages.bindfailed"));
+        else {
+            GadgetNBT.clearBoundPos(gadget);
+            player.sendOverlayMessage(Component.translatable("buildinggadgets2.messages.bindremoved"));
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Rotates through the registered building modes, useful for key bindings.
+     *
+     * @param stack the gadget
+     * @return the selected mode's id
+     */
+    public Identifier rotateModes(ItemStack stack) {
+        ImmutableSortedSet<BaseMode> modesForGadget = GadgetModes.INSTANCE.getModesForGadget(this.gadgetTarget());
+        var arrayOfModes = new ArrayList<>(modesForGadget); // This is required to work with index's
+        var currentMode = GadgetNBT.getMode(stack);
+
+        var modeIndex = arrayOfModes.indexOf(currentMode);
+
+        // Fix the mode or move it back to zero if the next index is outside of the list
+        if (modeIndex == -1 || (++modeIndex >= arrayOfModes.size())) {
+            modeIndex = 0; // Use zero if for some reason we can't find the mode
+        }
+
+        var mode = arrayOfModes.get(modeIndex);
+        GadgetNBT.setMode(stack, mode);
+
+        return mode.getId();
+    }
+
+    public abstract GadgetTarget gadgetTarget();
+
+    public static ItemStack getGadget(Player player) {
+        ItemStack heldItem = player.getMainHandItem();
+        if (!(heldItem.getItem() instanceof BaseGadget)) {
+            heldItem = player.getOffhandItem();
+            if (!(heldItem.getItem() instanceof BaseGadget)) {
+                return ItemStack.EMPTY;
+            }
+        }
+        return heldItem;
+    }
+
+    public static BlockPos getHitPos(ItemActionContext context) {
+        BlockPos anchorPos = GadgetNBT.getAnchorPos(context.stack());
+        return anchorPos.equals(GadgetNBT.nullPos) ? context.pos() : anchorPos;
+    }
+
+    public boolean canUndo(Level level, Player player, ItemStack gadget) {
+        BG2Data bg2Data = BG2Data.get(Objects.requireNonNull(level.getServer()).overworld());
+        UUID undoUUID = GadgetNBT.peekUndoList(gadget);
+        if (undoUUID == null) return false;
+        ArrayList<StatePos> undoList = bg2Data.peekUndoList(undoUUID);
+        if (undoList == null) return false;
+        for (StatePos statePos : undoList) {
+            if (!level.isLoaded(statePos.pos)) {
+                player.sendOverlayMessage(Component.translatable("buildinggadgets2.messages.undofailedunloaded", statePos.pos.toShortString()));
+                return false;
+            }
+        }
+        return true;
+    }
+
+    public void undo(Level level, Player player, ItemStack gadget) {
+        if (!canUndo(level, player, gadget)) return;
+        BG2Data bg2Data = BG2Data.get(Objects.requireNonNull(level.getServer()).overworld());
+        UUID buildUUID = GadgetNBT.popUndoList(gadget);
+        ServerTickHandler.stopBuilding(buildUUID);
+        ArrayList<StatePos> undoList = bg2Data.popUndoList(buildUUID);
+        if (undoList.isEmpty()) return;
+        Collections.reverse(undoList);
+
+        ArrayList<BlockPos> todoList = new ArrayList<>();
+        for (StatePos statePos : undoList) {
+            todoList.add(statePos.pos);
+        }
+        boolean giveItemsBack = !player.isCreative(); //Might want more conditions later?
+        BuildingUtils.removeTickHandler(level, player, todoList, giveItemsBack, giveItemsBack, gadget);
+    }
+
+    @Override
+    public boolean shouldCauseReequipAnimation(ItemStack oldStack, ItemStack newStack, boolean slotChanged) {
+        return false;
+    }
+}

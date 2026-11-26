@@ -1,0 +1,164 @@
+plugins {
+    id 'java-library'
+    id 'net.neoforged.moddev' version '2.0.148'
+    id 'idea'
+}
+
+tasks.named('wrapper', Wrapper).configure {
+    distributionType = Wrapper.DistributionType.BIN
+}
+
+version = "26.1.2.3-port.1"
+group = mod_group_id
+
+base {
+    archivesName = mod_id
+}
+
+sourceSets.main.resources {
+    srcDir('src/generated/resources')
+    exclude("**/*.bbmodel") // BlockBench project files
+    exclude("**/.cache/**") // datagen cache files
+}
+
+java {
+    toolchain {
+        languageVersion.set(JavaLanguageVersion.of(25))
+    }
+}
+
+neoForge {
+    version = project.neo_version
+
+    runs {
+        client {
+            client()
+            // Comma-separated list of namespaces to load gametests from. Empty = all namespaces.
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+
+        clientAuthed {
+            client()
+            devLogin = true
+            // Comma-separated list of namespaces to load gametests from. Empty = all namespaces.
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+
+        server {
+            server()
+            programArgument '--nogui'
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+
+        gameTestServer {
+            type = "gameTestServer"
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+
+        data {
+            type = "clientData"
+            programArguments.addAll '--mod', project.mod_id, '--all', '--output', file('src/generated/resources/').getAbsolutePath(), '--existing', file('src/main/resources/').getAbsolutePath()
+        }
+
+        configureEach {
+            systemProperty 'forge.logging.markers', 'REGISTRIES'
+            logLevel = org.slf4j.event.Level.DEBUG
+        }
+    }
+
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+}
+
+repositories {
+    mavenLocal()
+
+    // Third-party mod repositories — disabled while porting to 26.1.
+    // Re-enable alongside the matching dependencies block below.
+    //
+    maven { //JEI
+        url 'https://maven.blamejared.com'
+        content {
+            includeGroup "mezz.jei"
+        }
+    }
+
+    maven {
+        url = 'https://modmaven.dev/'
+        content {
+            includeGroup "appeng"
+        }
+    }
+
+    maven {
+        url = uri("https://maven.theillusivec4.top/")
+        content {
+            includeGroup "top.theillusivec4.curios"
+        }
+    }
+
+    maven { url = "https://www.cursemaven.com" }
+}
+
+// Sets up a dependency configuration called 'localRuntime'.
+// This configuration should be used instead of 'runtimeOnly' to declare
+// a dependency that will be present for runtime testing but that is
+// "optional", meaning it will not be pulled by dependents of this mod.
+configurations {
+    runtimeClasspath.extendsFrom localRuntime
+}
+
+dependencies {
+    implementation "net.neoforged:neoforge:${neo_version}"
+
+    // Third-party mod integrations — disabled while porting to 26.1.
+    // Re-enable one at a time after the base mod compiles against vanilla NeoForge.
+    //
+    ////AE2
+    compileOnly "org.appliedenergistics:appliedenergistics2:${ae2_version}:api"
+    //
+    // Curios — sourced from CurseForge (CurseMaven). project id 309927.
+    // Bump file id in gradle.properties (curios_file_id) when updating.
+    compileOnly "top.theillusivec4.curios:curios-neoforge:${curios_version}:api"
+    //
+    // JEI — API at compile time, full mod at runtime
+    compileOnly "mezz.jei:jei-${jei_mc_version}-common-api:${jei_version}"
+    compileOnly "mezz.jei:jei-${jei_mc_version}-neoforge-api:${jei_version}"
+    //
+    ////Patchouli
+    //compileOnly "vazkii.patchouli:Patchouli:${patchouli_version}:api"
+    //runtimeOnly "vazkii.patchouli:Patchouli:${patchouli_version}"
+}
+
+tasks.withType(ProcessResources).configureEach {
+    var replaceProperties = [
+            minecraft_version   : minecraft_version, minecraft_version_range: minecraft_version_range,
+            neo_version         : neo_version, neo_version_range: neo_version_range,
+            loader_version_range: loader_version_range,
+            mod_id              : mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: project.version,
+            mod_authors         : mod_authors, mod_description: mod_description,
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/neoforge.mods.toml']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8' // Use the UTF-8 charset for Java compilation
+}
+
+idea {
+    module {
+        downloadSources = true
+        downloadJavadoc = true
+    }
+}
+
+
+java { withSourcesJar() }
+tasks.withType(Jar).configureEach { from("LICENSE") }
